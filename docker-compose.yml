@@ -1,0 +1,15 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: accountic
+      POSTGRES_PASSWORD: accountic
+      POSTGRES_DB: accountic
+    ports:
+      - "5432:5432"
+    volumes:
+      - accountic_pg_data:/var/lib/postgresql/data
+
+volumes:
+  accountic_pg_data:

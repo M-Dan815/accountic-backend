@@ -1,0 +1,615 @@
+// Accountic — data model
+// Design notes:
+// - Every tenant-scoped table carries firmId and is always queried through
+//   it (see src/middleware/firmScope.ts) — this is how firm data isolation
+//   is enforced, not just at the UI layer.
+// - Money is stored as Decimal(18,2), never float, for accounting accuracy.
+// - JournalLine is the only table trial balances / statements are computed
+//   from — Transaction/Invoice records feed INTO journal lines, but the
+//   ledger math always runs off JournalLine so the calculation path is the
+//   same regardless of where a line originated.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Firm / auth
+// ---------------------------------------------------------------------------
+
+model Firm {
+  id        String   @id @default(cuid())
+  name      String
+  nameAr    String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users               User[]
+  clients             Client[]
+  accounts            Account[]
+  classificationRules ClassificationRule[]
+}
+
+enum UserRole {
+  OWNER
+  ACCOUNTANT
+}
+
+model User {
+  id           String   @id @default(cuid())
+  firmId       String
+  firm         Firm     @relation(fields: [firmId], references: [id])
+  email        String   @unique
+  passwordHash String
+  name         String
+  role         UserRole @default(ACCOUNTANT)
+  createdAt    DateTime @default(now())
+
+  @@index([firmId])
+}
+
+// ---------------------------------------------------------------------------
+// Client / Case
+// ---------------------------------------------------------------------------
+
+model Client {
+  id        String   @id @default(cuid())
+  firmId    String
+  firm      Firm     @relation(fields: [firmId], references: [id])
+  name      String
+  nameAr    String?
+  createdAt DateTime @default(now())
+
+  // ─── Client profile (spec §4.1 / §4.3) ─────────────────────────────────
+  crNumber              String?
+  vatNumber             String?
+  vatRegistered         Boolean @default(false)
+  // trading | services | contracting | logistics | other — decides which revenue
+  // account the questionnaire's "cash sales" option resolves to.
+  activity              String  @default("services")
+  materialityThreshold  Int     @default(200) // SAR; groups below it are approved in one go
+  revenueBasis          String  @default("invoices") // invoices | collections
+
+  cases Case[]
+  rules ClassificationRule[]
+
+  @@index([firmId])
+}
+
+enum CaseStatus {
+  UPLOADING
+  PROCESSING
+  IN_REVIEW
+  EXCEPTIONS
+  TB_APPROVED
+  COMPLETE
+}
+
+model Case {
+  id          String     @id @default(cuid())
+  firmId      String
+  clientId    String
+  client      Client     @relation(fields: [clientId], references: [id])
+  label       String // e.g. "FY 2024"
+  periodStart DateTime
+  periodEnd   DateTime
+  status      CaseStatus @default(UPLOADING)
+
+  // ─── Trial Balance readiness checklist flags ──────────────────────────
+  // The client was explicit that "Debit == Credit" is not sufficient for a
+  // TB to be approved: classification review, clarifications, opening
+  // balances, and adjustments must all be explicitly confirmed by the
+  // accountant before financial statements can be produced. These two
+  // booleans cover the two gates that have no other natural source of
+  // truth in the data model (opening balances come from a prior TB import;
+  // adjustments are manual non-bank journal entries). See
+  // modules/trial-balance/readiness.service.ts for how they feed the
+  // checklist rendered above the Generate button.
+  openingBalancesConfirmed Boolean @default(false)
+  adjustmentsConfirmed     Boolean @default(false)
+
+  // ─── Chart of accounts for THIS file (spec §4.1, §4.2) ─────────────────
+  // standard = the 252-account template copied at creation · client = uploaded
+  // and mapped · legacy = firm-level accounts that pre-date per-file charts.
+  chartMode     String  @default("standard")
+  framework     String  @default("sme")
+  isFirstYear   Boolean @default(false)
+  // uploaded | manual | first_year | unavailable — step 4 is mandatory (§4.4)
+  openingMode   String?
+  // { [checkKey]: { reason, by, at } } — warnings the accountant chose to pass with a written justification (§9.3)
+  releaseOverrides Json?
+
+  // ─── Client-facing clarification portal token ─────────────────────────
+  // Single bearer token the accountant generates to share this case's open
+  // clarifications with the client. Rotating (POST .../clarifications/request)
+  // generates a new value and invalidates the old one. Null means no active
+  // share link. Expiry is set at generation time (30 days) and enforced on
+  // every public read. See public-clarifications.routes.ts.
+  clientAccessToken          String?   @unique
+  clientAccessTokenExpiresAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  documents        Document[]
+  bankTransactions BankTransaction[]
+  invoices         Invoice[]
+  journalLines     JournalLine[]
+  exceptions       Exception[]
+  clarifications   Clarification[]
+
+  @@index([firmId])
+  @@index([clientId])
+}
+
+// ---------------------------------------------------------------------------
+// Documents (source files — every extracted record links back to one)
+// ---------------------------------------------------------------------------
+
+enum DocumentType {
+  BANK_STATEMENT
+  INVOICE
+  RECEIPT
+}
+
+enum DocumentStatus {
+  UPLOADED
+  EXTRACTING
+  EXTRACTED
+  FAILED
+}
+
+model Document {
+  id               String         @id @default(cuid())
+  firmId           String
+  caseId           String
+  case             Case           @relation(fields: [caseId], references: [id])
+  type             DocumentType
+  status           DocumentStatus @default(UPLOADED)
+  fileName         String
+  storageKey       String // path/key in local disk or S3
+  storageDriver    String // "local" | "s3"
+  mimeType         String
+  sizeBytes        Int
+  bankName         String? // for bank statements, which bank/account label
+  extractionMethod String? // "deterministic:al-rajhi" | "deterministic:daftra" | "ai:<provider>" | null
+  extractionError  String?
+  // Arithmetic verification of a bank-statement extraction:
+  // { status: VERIFIED|UNVERIFIED|FAILED, rows, direction, balanceChecked, issues[] }
+  extractionReport Json?
+  // The bank's own account in this file's chart (created under "النقد وما في حكمه").
+  bankAccountId    String?
+  iban             String?
+  openingBalance   Decimal?       @db.Decimal(18, 2)
+  closingBalance   Decimal?       @db.Decimal(18, 2)
+  uploadedAt       DateTime       @default(now())
+
+  bankTransactions BankTransaction[]
+  invoices         Invoice[]
+
+  @@index([firmId])
+  @@index([caseId])
+}
+
+// ---------------------------------------------------------------------------
+// Extracted records
+// ---------------------------------------------------------------------------
+
+model BankTransaction {
+  id         String   @id @default(cuid())
+  firmId     String
+  caseId     String
+  case       Case     @relation(fields: [caseId], references: [id])
+  documentId String
+  document   Document @relation(fields: [documentId], references: [id])
+
+  date          DateTime
+  description   String
+  descriptionAr String?
+
+  // Counterparty / merchant name pulled out of the bank description by the
+  // deterministic parser (see alRajhiStatementParser.ts). Kept as a first-
+  // class field rather than glued into `description` because the classifier,
+  // the AI prompt, and rule matching all rely on it being a clean signal.
+  counterparty String?
+
+  // ─── Statement enrichment (see extraction/statementEnricher.ts) ────────
+  // Structured reading of the raw bank text: movement kind, merchant,
+  // counterparty type, the purpose memo the sender typed, transfer/fee
+  // reference. `beneficiaryKey` is the stable identity of the other party
+  // (beneficiary account number, else normalised name) so ONE clarification
+  // or ONE learned rule can settle every payment to the same payee.
+  enrichment     Json?
+  beneficiaryKey String?
+
+  amount        Decimal  @db.Decimal(18, 2) // negative = debit/withdrawal, positive = credit/deposit
+  reference     String?
+  bankLabel     String? // e.g. "Al Rajhi ****4471"
+  rawRowIndex   Int? // page/row this came from, for traceability back into the PDF
+
+  matchStatus      MatchStatus @default(UNMATCHED)
+  matchConfidence  Decimal     @default(0) @db.Decimal(4, 3)
+  matchedInvoiceId String?
+  matchedInvoice   Invoice?    @relation(fields: [matchedInvoiceId], references: [id])
+
+  categoryAccountId  String?
+  categoryAccount    Account?        @relation(fields: [categoryAccountId], references: [id])
+  categoryConfidence Decimal         @default(0) @db.Decimal(4, 3)
+  categorySource     CategorySource?
+
+  // ─── Explainable classification ────────────────────────────────────────
+  // The client's own benchmark (the ChatGPT Excel) always carries a
+  // "سبب المعالجة" column next to every proposed account. That is the
+  // audit trail that turns a category from a black-box suggestion into
+  // something the accountant can trust or override with understanding.
+  //
+  // `categoryReason` is the human-readable explanation. `categoryReasonSource`
+  // is a short tag ("rule" | "ai" | "manual" | "prior-approval") so the UI
+  // can visually distinguish a deterministic match from an AI guess from a
+  // human decision. Both are nullable so historic rows remain valid.
+  categoryReason       String?
+  categoryReasonSource String?
+
+  // ─── Split categorization (Anas feedback #2) ──────────────────────────
+  // Some transactions genuinely belong to multiple accounts (e.g. a fuel +
+  // snack POS purchase that should split 80/20 between Transport and
+  // Hospitality). When `splits` is non-null, the journal-entry generator
+  // posts one JournalLine per split entry (debit-side) instead of a single
+  // line for `categoryAccountId`. Format:
+  //   [{ "accountId": "...", "amount": 80.00 }, { "accountId": "...", "amount": 20.00 }]
+  // (amounts are absolute SAR, must sum to |txn.amount| within 1 hellip). When
+  // null, the journal uses `categoryAccountId` as before — backwards compat
+  // for existing rows and the simple single-account workflow.
+  splits Json?
+
+  // ─── Refund pairing (Anas feedback #4) ───────────────────────────────
+  // When this transaction is a refund (kind=PURCHASE_REFUND or
+  // SADAD_REFUND), `pairedWithTxnId` points at the original purchase it
+  // reverses. The pairing is detected post-extraction by a small matcher
+  // in processing.service.ts (same merchant + similar amount + close date).
+  // The reconciliation UI renders this as "Refund of {original txn date ·
+  // merchant}" instead of treating the refund as a standalone row.
+  pairedWithTxnId String?
+  pairedWithTxn   BankTransaction? @relation("RefundPairing", fields: [pairedWithTxnId], references: [id])
+  refundPairs     BankTransaction[] @relation("RefundPairing")
+
+  duplicateOfId String?
+
+  reviewedAt DateTime?
+  reviewedBy String?
+
+  createdAt DateTime @default(now())
+
+  journalLines  JournalLine[]
+  // Inverse of Clarification.bankTransaction (1:1 — one open question per
+  // transaction; the question and its answer live on the same row).
+  clarification Clarification?
+
+  @@index([firmId])
+  @@index([caseId])
+  @@index([documentId])
+  @@index([caseId, beneficiaryKey])
+}
+
+enum MatchStatus {
+  MATCHED
+  NEEDS_REVIEW
+  UNMATCHED
+}
+
+enum CategorySource {
+  RULE
+  AI
+  MANUAL
+}
+
+model Invoice {
+  id         String   @id @default(cuid())
+  firmId     String
+  caseId     String
+  case       Case     @relation(fields: [caseId], references: [id])
+  documentId String
+  document   Document @relation(fields: [documentId], references: [id])
+
+  invoiceNumber   String?
+  date            DateTime?
+  counterparty    String? // supplier or customer name
+  amountBeforeVat Decimal?         @db.Decimal(18, 2)
+  vatAmount       Decimal?         @db.Decimal(18, 2)
+  amountTotal     Decimal          @db.Decimal(18, 2)
+  description     String?
+  direction       InvoiceDirection @default(PAYABLE) // payable = we paid it (expense), receivable = we billed it (revenue)
+
+  createdAt DateTime @default(now())
+
+  matchedTransactions BankTransaction[]
+  // One invoice can have multiple questions open against it (e.g. "which
+  // PO is this against?" and "is the VAT rate correct?"), so many-to-one.
+  clarifications      Clarification[]
+
+  @@index([firmId])
+  @@index([caseId])
+  @@index([documentId])
+}
+
+enum InvoiceDirection {
+  PAYABLE
+  RECEIVABLE
+}
+
+// ---------------------------------------------------------------------------
+// Chart of Accounts (per firm, seeded from a real CoA export, reusable across cases)
+// ---------------------------------------------------------------------------
+
+enum AccountType {
+  ASSET
+  LIABILITY
+  EQUITY
+  REVENUE
+  EXPENSE
+}
+
+model Account {
+  id         String      @id @default(cuid())
+  firmId     String
+  firm       Firm        @relation(fields: [firmId], references: [id])
+  // null = legacy firm-level account (pre-dates per-file charts). Otherwise the
+  // account belongs to that case's own copy of the chart.
+  caseId     String?
+  code       String // standard: "110101" · client tree: whatever the client uses
+  name       String // English name (or the imported name for a client tree)
+  nameAr     String?
+  type       AccountType
+  parentCode String?
+  postable   Boolean     @default(true) // standard tree: only level-4 accounts
+
+  // ─── Standard-tree metadata (coa_seed.json) ────────────────────────────
+  level        Int?
+  nature       String? // debit | credit
+  statement    String? // balance_sheet | income_statement
+  fsLine       String? // Arabic financial-statement line
+  fsLineEn     String?
+  cfClass      String? // cash | operating | investing | financing | non_cash | profit
+  stdKey       String? // the stable key the AI classifies on
+  isContra     Boolean @default(false)
+  systemLocked Boolean @default(false)
+  vatDefault   String?
+  keywordsAr   String[] @default([])
+  keywordsEn   String[] @default([])
+  active       Boolean @default(true)
+  isCustom     Boolean @default(false)
+
+  // Opening balance for THIS file (the account is per-file, so it is no longer
+  // shared between a firm's clients).
+  openingBalance Decimal @default(0) @db.Decimal(18, 2)
+
+  // Whether this account needs a supporting document (receivables, capital, loans).
+  requiresSupportingDoc Boolean @default(false)
+
+  classificationRules ClassificationRule[]
+  bankTransactions    BankTransaction[]
+  journalLines        JournalLine[]
+  clarificationProposals Clarification[] @relation("ClarificationProposedAccount")
+
+  @@unique([firmId, caseId, code])
+  @@index([firmId])
+  @@index([caseId])
+  @@index([caseId, stdKey])
+}
+
+// ---------------------------------------------------------------------------
+// Classification rules — deterministic-first, reused across a firm's future cases
+// ---------------------------------------------------------------------------
+
+model ClassificationRule {
+  id          String   @id @default(cuid())
+  firmId      String
+  firm        Firm     @relation(fields: [firmId], references: [id])
+  matchText   String // what to match against (substring of description or counterparty)
+  // Rules outlive a file's chart: they are resolved by accountCode → stdKey in
+  // the file being processed. accountId is a convenience link only.
+  accountId   String?
+  account     Account? @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  accountCode String?
+  accountStdKey String?
+  // null = firm-wide (seeded); set = a CLIENT rule (highest priority, §4.3)
+  clientId    String?
+  client      Client?  @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  direction   String?  // debit | credit | null (any)
+  minAmount   Decimal? @db.Decimal(18, 2)
+  maxAmount   Decimal? @db.Decimal(18, 2)
+
+  // How `matchText` should be interpreted:
+  //   "substring"      — case-insensitive substring of the description
+  //   "merchant"       — case-insensitive substring of the counterparty name
+  //   "amount-pattern" — matches description substring AND an exact amount
+  //   "beneficiary"    — exact BankTransaction.beneficiaryKey (one payee = one rule)
+  // Set by the UI when the accountant approves an override, so repeated
+  // descriptions do not accumulate 40-char truncated rules that miss the
+  // next spelling variant. See classification.engine.ts.
+  ruleKind String @default("substring")
+
+  createdFrom String? // "seed" | "accountant-approval:<transactionId>" | "clarification:<id>"
+  createdAt   DateTime @default(now())
+
+  @@index([firmId])
+  @@index([clientId])
+}
+
+// Saved "تحديد الأعمدة" mappings, keyed by the source system (قيود, دفترة, …).
+model ImportTemplate {
+  id         String   @id @default(cuid())
+  firmId     String
+  kind       String   // trial_balance | chart
+  sourceName String
+  template   Json
+  createdAt  DateTime @default(now())
+
+  @@unique([firmId, kind, sourceName])
+}
+
+// ---------------------------------------------------------------------------
+// Journal / ledger — the ONLY source of truth for Trial Balance + statements
+// ---------------------------------------------------------------------------
+
+model JournalLine {
+  id                String           @id @default(cuid())
+  firmId            String
+  caseId            String
+  case              Case             @relation(fields: [caseId], references: [id])
+  accountId         String
+  account           Account          @relation(fields: [accountId], references: [id])
+  bankTransactionId String?
+  bankTransaction   BankTransaction? @relation(fields: [bankTransactionId], references: [id])
+
+  // ─── Manual adjustment grouping ───────────────────────────────────────
+  // Manual adjustments and accruals (see modules/adjustments/) are stored
+  // as exactly one debit line + one credit line sharing an adjustmentGroupId.
+  // Both lines have bankTransactionId = null. This is how generateTrialBalance
+  // (trial-balance.service.ts) knows to leave them alone when it regenerates
+  // bank-derived lines: it only touches lines where bankTransactionId is
+  // non-null, so the accountant's manual work survives a regenerate.
+  adjustmentGroupId String?
+
+  date   DateTime
+  debit  Decimal  @default(0) @db.Decimal(18, 2)
+  credit Decimal  @default(0) @db.Decimal(18, 2)
+  memo   String?
+
+  createdAt DateTime @default(now())
+
+  @@index([firmId])
+  @@index([caseId])
+  @@index([accountId])
+  @@index([adjustmentGroupId])
+}
+
+// ---------------------------------------------------------------------------
+// Exceptions — the accountant's actual worklist
+// ---------------------------------------------------------------------------
+
+enum ExceptionType {
+  UNMATCHED_TRANSACTION
+  UNMATCHED_INVOICE
+  LOW_CONFIDENCE_CATEGORY
+  POSSIBLE_DUPLICATE
+  MISSING_INFO
+
+  // ─── New lanes the client asked for ────────────────────────────────────
+  // The client's architecture feedback was explicit that two situations
+  // are NOT the same thing and must not be collapsed into one bucket:
+  //
+  //   NEEDS_CLIENT_CLARIFICATION
+  //     The system inferred nothing at all (no rule matched, AI confidence
+  //     was 0 or unavailable). Only the client can explain what this was.
+  //     This is the row-358 pattern from the client's Excel: an unexplained
+  //     1,750 SAR transfer → "حساب معلّق - يحتاج تحديد" + "معلّق - يحتاج إفادة".
+  //
+  //   MISSING_SUPPORTING_DOC
+  //     The classification is HIGH-confidence but no invoice/receipt is
+  //     attached. The client was very explicit: "A missing invoice should
+  //     not automatically make the accounting classification uncertain."
+  //     This is a document-status flag, not a classification flag. It is
+  //     informational — it does NOT block Trial Balance generation.
+  NEEDS_CLIENT_CLARIFICATION
+  MISSING_SUPPORTING_DOC
+}
+
+enum ExceptionStatus {
+  OPEN
+  RESOLVED
+  FLAGGED_MISSING_DOC
+}
+
+model Exception {
+  id                String          @id @default(cuid())
+  firmId            String
+  caseId            String
+  case              Case            @relation(fields: [caseId], references: [id])
+  type              ExceptionType
+  status            ExceptionStatus @default(OPEN)
+  bankTransactionId String?
+  invoiceId         String?
+  note              String?
+  resolvedAt        DateTime?
+  resolvedBy        String?
+  createdAt         DateTime        @default(now())
+
+  @@index([firmId])
+  @@index([caseId])
+}
+
+// ---------------------------------------------------------------------------
+// Clarifications — the "ask the client" lane, separate from the accountant's
+// exception queue. See modules/cases/clarification.service.ts.
+// ---------------------------------------------------------------------------
+
+enum ClarificationStatus {
+  OPEN
+  ANSWERED
+}
+
+model Clarification {
+  id     String @id @default(cuid())
+  firmId String
+  caseId String
+  case   Case   @relation(fields: [caseId], references: [id])
+
+  // 1:1 with a bank transaction. A given transaction has at most one open
+  // question at a time — if the accountant wants to ask a second question
+  // about the same transaction, they reply and re-open.
+  bankTransactionId String?          @unique
+  bankTransaction   BankTransaction? @relation(fields: [bankTransactionId], references: [id])
+
+  // Many-to-one: one invoice can have multiple questions asked against it.
+  invoiceId String?
+  invoice   Invoice? @relation(fields: [invoiceId], references: [id])
+
+  question   String
+  questionAr String?
+  // Multiple-choice questionnaire (coa_seed.json → questions[]): the question id
+  // (Q01…Q10) and the resolved options, each already bound to an account/action.
+  questionId String?
+  options    Json?
+
+  answer     String?
+  answeredAt DateTime?
+  // Either a real User.id (accountant answered it themselves) or
+  // "client:<contact-identifier>" once the client-facing portal ships.
+  // The portal uses "client:portal" for now.
+  answeredBy String?
+
+  // ─── AI pattern hypothesis (see patternDetector.ts + ai-provider.ts) ─────
+  // When the pattern detector finds a recurring group (same payee + same
+  // day-of-month + monthly cadence), an AI call interprets the pattern into
+  // a natural-language question + a proposed account hypothesis. The
+  // accountant sees the question text; the client portal additionally sees
+  // the proposed account and can confirm it with one click
+  // (see public-clarifications.routes.ts → confirmHypothesis).
+  //
+  // `proposedAccountId` is the AI's best-guess account for THIS group; the
+  // client confirms or denies. If confirmed, `answerClarification` invokes
+  // `learnFromDecision` which settles every sibling transaction to the same
+  // payee (see classification/learning.ts → propagateToPayeeSiblings).
+  //
+  // `detectedPattern` is the raw signals (cadence / day-of-month / amount
+  // range / counterparty type) so the UI can render "why did the AI think
+  // this was salaries?" — same audit-trail principle as
+  // BankTransaction.categoryReason.
+  proposedAccountId String?
+  proposedAccount   Account? @relation("ClarificationProposedAccount", fields: [proposedAccountId], references: [id])
+  detectedPattern   Json?
+  hypothesisReason  String?
+
+  status    ClarificationStatus @default(OPEN)
+  createdAt DateTime            @default(now())
+
+  @@index([firmId])
+  @@index([caseId])
+  @@index([status])
+}
